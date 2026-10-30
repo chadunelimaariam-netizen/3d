@@ -1,0 +1,1067 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Glass Fruit ASMR</title>
+<style>html,body{margin:0;background:#000;overflow:hidden}canvas{display:block;max-height:100vh;margin:0 auto}</style>
+<script type="importmap">{"imports":{"three":"/three/build/three.module.js","three/addons/":"/three/examples/jsm/"}}</script>
+</head>
+<body>
+<script type="module">
+import * as THREE from 'three';
+import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+import { BokehPass } from 'three/addons/postprocessing/BokehPass.js';
+import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
+
+const params = new URLSearchParams(location.search);
+const W = +params.get('w') || 1080, H = +params.get('h') || 1920;
+const FRUIT = params.get('fruit') || 'apple';
+const DURATION = 8;
+
+// ---------- helpers ----------
+function mulberry32(a) { return function () { a |= 0; a = a + 0x6D2B79F5 | 0; let t = Math.imul(a ^ a >>> 15, 1 | a); t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; }; }
+const rng = mulberry32(7);
+const clamp = (x, a, b) => Math.min(b, Math.max(a, x));
+const lerp = (a, b, t) => a + (b - a) * t;
+const seg = (t, a, b) => clamp((t - a) / (b - a), 0, 1);
+const smooth = t => t * t * (3 - 2 * t);
+const easeOut = t => 1 - Math.pow(1 - t, 3);
+const easeIn = t => t * t * t;
+const easeInOutSine = t => -(Math.cos(Math.PI * t) - 1) / 2;
+const deg = THREE.MathUtils.degToRad;
+
+// ---------- timeline (seconds) ----------
+const T = {
+  approachStart: 0.7, approachEnd: 2.1, touch: 2.45, crack: 2.85, cutStart: 2.95,
+  cutEnd: 5.25, lift: 5.6, liftEnd: 6.2, fallStart: 6.0, land: 6.55, end: DURATION,
+};
+
+// ---------- fruit profiles (surface of revolution around Y, listed bottom -> top) ----------
+function splineProfile(ctrl) {
+  const pts = new THREE.SplineCurve(ctrl.map(([x, y]) => new THREE.Vector2(x, y))).getPoints(160);
+  pts.forEach(p => { p.x = Math.max(p.x, 1e-4); });
+  pts[0].x = pts[pts.length - 1].x = 1e-4;
+  return pts;
+}
+function appleProfile() {
+  const pts = [], n = 140;
+  for (let i = 0; i <= n; i++) {
+    const t = i / n * Math.PI;
+    const r = Math.sin(t) * (1 - 0.12 * Math.cos(t));
+    let y = -Math.cos(t) * 0.88;
+    y += (y > 0 ? -0.24 : 0.12) * Math.exp(-Math.pow(r / 0.3, 2));
+    pts.push(new THREE.Vector2(Math.max(r, 1e-4), y));
+  }
+  return pts;
+}
+
+// ---------- per-fruit look ----------
+// colour(x, y, z, angle, out) paints the skin; cap(g, S, k) paints the cross-section.
+const FRUITS = {
+  apple: {
+    profile: appleProfile,
+    skin: { roughness: 0.05, clearcoat: 1, clearcoatRoughness: 0.02, iridescence: 0.12, sheen: 0.3, sheenColor: '#ff8080' },
+    colour(x, y, z, a, c) {
+      const streak = 0.5 + 0.5 * Math.sin(a * 9 + Math.sin(a * 3) * 2 + y * 3);
+      c.set('#d3172a').lerp(new THREE.Color('#7e0814'), 0.45 * streak * smooth(seg(y, -0.6, 0.5)));
+      c.lerp(new THREE.Color('#ee9a2c'), 0.55 * smooth(seg(-y, 0.1, 0.7)) * (0.5 + 0.5 * Math.cos(a - 1.0)));
+      c.lerp(new THREE.Color('#7e0814'), 0.5 * smooth(seg(y, 0.55, 0.75)) * Math.exp(-Math.pow(Math.hypot(x, z) / 0.35, 2)));
+    },
+    stem: { pts: top => [[0, top - 0.06], [-0.03, top + 0.1], [-0.12, top + 0.26], [-0.22, top + 0.36]], radius: 0.038, color: '#5b3518' },
+    leaf: { at: 1, offset: [0.02, -0.03, 0.03], scale: 1, color: '#2f9d48' },
+    shard: '#c81a2a',
+    cam: { dist: 10.4, target: 0.88 },
+    audio: { seed: 99, pitch: 1 },
+    cap(g, S, k) {
+      const { P, path, U } = k;
+      g.fillStyle = '#b3111f'; g.fillRect(0, 0, S, S);
+      const [cx, cy] = P(0, 0.05);
+      const grd = g.createRadialGradient(cx, cy, 10, cx, cy, S * 0.55);
+      grd.addColorStop(0, '#fffaf6'); grd.addColorStop(0.55, '#fbe6de'); grd.addColorStop(1, '#efb5ad');
+      g.fillStyle = grd; g.fill(path);
+      g.save(); g.clip(path);
+      frost(g, S, 'rgba(190,110,110,');
+      for (const [lw, a] of [[90, 0.18], [60, 0.3], [36, 0.55], [18, 0.85], [8, 1]]) { g.lineWidth = lw; g.strokeStyle = `rgba(196,18,36,${a})`; g.stroke(path); }
+      const [kx, ky] = P(0, 0.08);
+      g.beginPath(); g.ellipse(kx, ky, U(0.22), U(0.27, 1), 0, 0, Math.PI * 2);
+      g.fillStyle = 'rgba(255,236,214,0.55)'; g.fill(); g.lineWidth = 5; g.strokeStyle = 'rgba(214,150,120,0.55)'; g.stroke();
+      const [tx, ty] = P(0, 0.62); g.beginPath(); g.moveTo(tx, ty); g.lineTo(kx, ky - U(0.27, 1)); g.lineWidth = 3; g.stroke();
+      seeds(g, kx, ky + U(0.03, 1), U(0.09), U(0.07, 1), '#8a3a12', '#2e0f05');
+      g.restore();
+    },
+  },
+
+  pear: {
+    profile: () => splineProfile([[0, -0.86], [0.25, -0.9], [0.6, -0.86], [0.88, -0.62], [0.99, -0.22], [0.93, 0.18], [0.74, 0.52], [0.55, 0.82], [0.46, 1.08], [0.39, 1.32], [0.25, 1.5], [0, 1.55]]),
+    skin: { roughness: 0.06, clearcoat: 1, clearcoatRoughness: 0.02, iridescence: 0.2, sheen: 0.4, sheenColor: '#ffe7a0' },
+    colour(x, y, z, a, c) {
+      c.set('#e8ad1c');
+      c.lerp(new THREE.Color('#a9b52e'), 0.65 * smooth(seg(y, 0.5, 1.45)));
+      c.lerp(new THREE.Color('#c9561a'), 0.5 * (0.5 + 0.5 * Math.cos(a - 0.6)) * smooth(seg(y, -0.7, 0.4)) * (1 - smooth(seg(y, 0.6, 1.1))));
+      c.lerp(new THREE.Color('#9a6a0c'), 0.6 * smooth(seg(-y, 0.7, 0.88)));
+    },
+    skinMap(g, w, h) { // freckles (lenticels)
+      g.fillStyle = '#fff'; g.fillRect(0, 0, w, h);
+      for (let i = 0; i < 4500; i++) { g.fillStyle = `rgba(110,60,15,${0.15 + rng() * 0.4})`; g.beginPath(); g.ellipse(rng() * w, rng() * h, 0.6 + rng() * 2.4, 0.6 + rng() * 1.6, 0, 0, Math.PI * 2); g.fill(); }
+    },
+    stem: { pts: top => [[0, top - 0.05], [-0.02, top + 0.14], [-0.09, top + 0.32], [-0.2, top + 0.44]], radius: 0.036, color: '#6b4420' },
+    leaf: { at: 0.75, offset: [0.03, -0.02, 0.03], scale: 0.9, color: '#3c9e3a' },
+    shard: '#e0a418',
+    cam: { dist: 11.8, target: 1.28 },
+    audio: { seed: 1234, pitch: 0.85 },
+    cap(g, S, k) {
+      const { P, path, U } = k;
+      g.fillStyle = '#c98a12'; g.fillRect(0, 0, S, S);
+      const [cx, cy] = P(0, -0.1);
+      const grd = g.createRadialGradient(cx, cy, 10, cx, cy, S * 0.6);
+      grd.addColorStop(0, '#fff8e0'); grd.addColorStop(0.6, '#f6e2a8'); grd.addColorStop(1, '#e6c070');
+      g.fillStyle = grd; g.fill(path);
+      g.save(); g.clip(path);
+      for (let i = 0; i < 2200; i++) { g.fillStyle = `rgba(205,170,100,${rng() * 0.18})`; g.beginPath(); g.arc(rng() * S, rng() * S, 0.8 + rng() * 2.5, 0, Math.PI * 2); g.fill(); }
+      frost(g, S, 'rgba(200,160,80,');
+      for (const [lw, a] of [[80, 0.14], [50, 0.25], [28, 0.5], [14, 0.85], [6, 1]]) { g.lineWidth = lw; g.strokeStyle = `rgba(212,148,18,${a})`; g.stroke(path); }
+      const [kx, ky] = P(0, -0.2);
+      g.beginPath(); g.ellipse(kx, ky, U(0.24), U(0.4, 1), 0, 0, Math.PI * 2);
+      g.fillStyle = 'rgba(255,248,226,0.75)'; g.fill(); g.lineWidth = 7; g.strokeStyle = 'rgba(184,138,66,0.65)'; g.stroke();
+      const [tx, ty] = P(0, 1.5); g.beginPath(); g.moveTo(tx, ty); g.lineTo(kx, ky - U(0.4, 1)); g.lineWidth = 5; g.stroke();
+      seeds(g, kx, ky + U(0.04, 1), U(0.17), U(0.17, 1), '#8a5220', '#2a1405');
+      g.restore();
+    },
+  },
+
+  orange: {
+    profile: () => splineProfile([[0, -0.82], [0.2, -0.86], [0.55, -0.8], [0.85, -0.5], [0.99, -0.04], [0.95, 0.4], [0.72, 0.75], [0.36, 0.9], [0.13, 0.88], [0, 0.85]]),
+    skin: { roughness: 0.1, clearcoat: 1, clearcoatRoughness: 0.03, iridescence: 0.15, sheen: 0.3, sheenColor: '#ffc070', bumpScale: 2.2 },
+    colour(x, y, z, a, c) {
+      const mott = 0.5 + 0.5 * Math.sin(a * 13 + y * 7 + Math.sin(a * 5) * 1.5);
+      c.set('#ff7f0c').lerp(new THREE.Color('#e45a00'), 0.35 * mott);
+      c.lerp(new THREE.Color('#ffa024'), 0.35 * smooth(seg(y, -0.2, 0.6)) * (0.5 + 0.5 * Math.cos(a + 0.8)));
+      c.lerp(new THREE.Color('#9a8a1a'), 0.6 * Math.exp(-Math.pow(Math.hypot(x, z) / 0.12, 2)) * smooth(seg(y, 0.6, 0.85)));
+    },
+    skinMap(g, w, h) {
+      g.fillStyle = '#fff'; g.fillRect(0, 0, w, h);
+      for (let i = 0; i < 9000; i++) { g.fillStyle = `rgba(200,80,0,${rng() * 0.18})`; g.beginPath(); g.arc(rng() * w, rng() * h, 0.6 + rng() * 1.8, 0, Math.PI * 2); g.fill(); }
+    },
+    bumpMap(g, w, h) { // peel pores
+      g.fillStyle = '#808080'; g.fillRect(0, 0, w, h);
+      for (let i = 0; i < 14000; i++) {
+        const x = rng() * w, y = rng() * h, r = 1.2 + rng() * 2.6;
+        const gr = g.createRadialGradient(x, y, 0, x, y, r);
+        gr.addColorStop(0, 'rgba(0,0,0,0.55)'); gr.addColorStop(1, 'rgba(0,0,0,0)');
+        g.fillStyle = gr; g.fillRect(x - r, y - r, 2 * r, 2 * r);
+      }
+    },
+    stem: { pts: top => [[0, top - 0.04], [-0.01, top + 0.05], [-0.035, top + 0.1]], radius: 0.05, color: '#6d7f2a' },
+    calyx: { color: '#4f8f2c' },
+    leaf: { at: 1, offset: [0.0, -0.03, 0.03], scale: 1.15, color: '#2c8f3e' },
+    shard: '#ff7a10',
+    cam: { dist: 10.6, target: 0.92 },
+    audio: { seed: 4321, pitch: 1.12 },
+    cap(g, S, k) {
+      const { P, path, U, outerR } = k;
+      g.fillStyle = '#f06a00'; g.fillRect(0, 0, S, S);
+      const [cx, cy] = P(0, 0);
+      const grd = g.createRadialGradient(cx, cy, 10, cx, cy, S * 0.55);
+      grd.addColorStop(0, '#ffe2a6'); grd.addColorStop(0.55, '#ffb444'); grd.addColorStop(1, '#f68a10');
+      g.fillStyle = grd; g.fill(path);
+      g.save(); g.clip(path);
+      // juice sacs radiating out from the core
+      for (let i = 0; i < 3200; i++) {
+        const fx = (rng() * 2 - 1) * 0.95, fy = -0.8 + rng() * 1.6;
+        if (Math.abs(fx) > outerR(fy) * 0.86) continue;
+        const [x, y] = P(fx, fy), ang = Math.atan2(-fy * 0.35, fx);
+        g.save(); g.translate(x, y); g.rotate(ang);
+        g.beginPath(); g.ellipse(0, 0, 7 + rng() * 12, 2 + rng() * 3, 0, 0, Math.PI * 2);
+        g.fillStyle = `rgba(255,${200 + rng() * 55 | 0},${120 + rng() * 100 | 0},${0.18 + rng() * 0.3})`; g.fill();
+        g.strokeStyle = 'rgba(214,110,10,0.18)'; g.lineWidth = 1; g.stroke();
+        g.restore();
+      }
+      // segment membranes (meridians seen edge-on)
+      for (let kk = -3; kk <= 3; kk++) {
+        if (kk === 0) continue;
+        const c = Math.sin(kk * Math.PI / 7);
+        g.beginPath();
+        for (let fy = -0.74; fy <= 0.78; fy += 0.02) { const [x, y] = P(outerR(fy) * 0.86 * c, fy); fy > -0.74 ? g.lineTo(x, y) : g.moveTo(x, y); }
+        g.strokeStyle = 'rgba(255,244,226,0.7)'; g.lineWidth = 4; g.stroke();
+      }
+      // central pith column
+      const [c0x, c0y] = P(0, -0.74), [, c1y] = P(0, 0.78);
+      g.fillStyle = 'rgba(255,246,232,0.85)'; g.fillRect(c0x - U(0.04) / 2, c1y, U(0.04), c0y - c1y);
+      frost(g, S, 'rgba(255,140,0,');
+      // white pith then a thin peel
+      g.lineWidth = U(0.2); g.strokeStyle = 'rgba(255,240,214,0.97)'; g.stroke(path);
+      g.lineWidth = U(0.07); g.strokeStyle = '#f06800'; g.stroke(path);
+      g.lineWidth = U(0.03); g.strokeStyle = '#e05a00'; g.stroke(path);
+      seeds(g, cx, cy + U(0.1, 1), U(0.12), U(0.06, 1), '#fff4dc', '#e8c890');
+      g.restore();
+    },
+  },
+};
+// real red apple under a honey glaze, cut smoothly (no crack, no shards)
+FRUITS.honeyapple = {
+  ...FRUITS.apple,
+  honey: true, shards: false, smoothCut: true, realCut: true, lumpy: true, juice: true, aperture: 0.0022,
+  colour(x, y, z, a, c) { // colour lives in skinMap; vertex colour only darkens the stem cavity
+    c.setScalar(1 - 0.35 * Math.exp(-Math.pow(Math.hypot(x, z) / 0.3, 2)) * smooth(seg(y, 0.4, 0.7)));
+  },
+  skin: { roughness: 0.42, clearcoat: 0.35, clearcoatRoughness: 0.12, iridescence: 0, sheen: 0.35, sheenColor: '#ff9a8a', sheenRoughness: 0.5, bumpScale: 0.6 },
+  skinMap(g, w, h) { // u runs around the apple, v from calyx (bottom row) to stem (top row)
+    const vg = g.createLinearGradient(0, 0, 0, h);
+    vg.addColorStop(0, '#b8a040'); vg.addColorStop(0.05, '#c46a2a'); vg.addColorStop(0.12, '#a8101c'); vg.addColorStop(0.55, '#b51522');
+    vg.addColorStop(0.85, '#c0301f'); vg.addColorStop(0.95, '#c79a3a'); vg.addColorStop(1, '#a08a3a');
+    g.fillStyle = vg; g.fillRect(0, 0, w, h);
+    const wrap = fn => { fn(0); fn(-w); fn(w); }; // tile across the lathe seam
+    for (let i = 0; i < 40; i++) { // blush and sun-side patches
+      const x = rng() * w, y = h * (0.15 + rng() * 0.7), r = 80 + rng() * 260, yellow = rng() < 0.35;
+      wrap(o => {
+        const gr = g.createRadialGradient(x + o, y, 0, x + o, y, r);
+        gr.addColorStop(0, yellow ? 'rgba(214,150,50,0.22)' : 'rgba(120,6,18,0.3)'); gr.addColorStop(1, 'rgba(0,0,0,0)');
+        g.fillStyle = gr; g.fillRect(x + o - r, y - r, 2 * r, 2 * r);
+      });
+    }
+    for (let i = 0; i < 1600; i++) { // streaks running stem to calyx
+      const x = rng() * w, y0 = h * (0.04 + rng() * 0.3), y1 = y0 + h * (0.25 + rng() * 0.6), dark = rng() < 0.6;
+      g.strokeStyle = dark ? `rgba(110,4,16,${0.12 + rng() * 0.25})` : `rgba(230,70,50,${0.08 + rng() * 0.18})`;
+      g.lineWidth = 1 + rng() * 4;
+      wrap(o => { g.beginPath(); for (let y = y0; y <= y1; y += 8) { const xx = x + o + Math.sin(y * 0.01 + i) * 6; y === y0 ? g.moveTo(xx, y) : g.lineTo(xx, y); } g.stroke(); });
+    }
+    for (let i = 0; i < 5000; i++) { // lenticels
+      const r = 0.6 + rng() * 1.6;
+      g.fillStyle = `rgba(240,210,150,${0.35 + rng() * 0.45})`;
+      g.beginPath(); g.ellipse(rng() * w, h * (0.06 + rng() * 0.88), r, r * 0.8, 0, 0, Math.PI * 2); g.fill();
+    }
+  },
+  bumpMap(g, w, h) {
+    g.fillStyle = '#808080'; g.fillRect(0, 0, w, h);
+    for (let i = 0; i < 30000; i++) { g.fillStyle = `rgba(${rng() < 0.5 ? '0,0,0' : '255,255,255'},${rng() * 0.12})`; g.fillRect(rng() * w, rng() * h, 1 + rng() * 2, 1 + rng() * 2); }
+    for (let i = 0; i < 4000; i++) { g.fillStyle = `rgba(255,255,255,${0.2 + rng() * 0.3})`; g.beginPath(); g.arc(rng() * w, rng() * h, 0.8 + rng() * 1.4, 0, Math.PI * 2); g.fill(); }
+  },
+  roughMap(g, w, h) { // waxy, slightly uneven bloom
+    g.fillStyle = '#9a9a9a'; g.fillRect(0, 0, w, h);
+    for (let i = 0; i < 300; i++) {
+      const x = rng() * w, y = rng() * h, r = 30 + rng() * 140, gr = g.createRadialGradient(x, y, 0, x, y, r);
+      gr.addColorStop(0, rng() < 0.5 ? 'rgba(60,60,60,0.25)' : 'rgba(230,230,230,0.25)'); gr.addColorStop(1, 'rgba(0,0,0,0)');
+      g.fillStyle = gr; g.fillRect(x - r, y - r, 2 * r, 2 * r);
+    }
+  },
+  leafMap(g, w, h) {
+    const gr = g.createLinearGradient(0, 0, 0, h);
+    gr.addColorStop(0, '#2f6e1e'); gr.addColorStop(0.5, '#4f9a2e'); gr.addColorStop(1, '#2f6e1e');
+    g.fillStyle = gr; g.fillRect(0, 0, w, h);
+    g.strokeStyle = 'rgba(200,230,150,0.7)'; g.lineWidth = 5;
+    g.beginPath(); g.moveTo(0, h / 2); g.lineTo(w, h / 2); g.stroke();
+    g.lineWidth = 2; g.strokeStyle = 'rgba(190,225,140,0.45)';
+    for (let x = 30; x < w; x += 45) for (const s of [-1, 1]) { g.beginPath(); g.moveTo(x, h / 2); g.quadraticCurveTo(x + 40, h / 2 + s * h * 0.2, x + 70, h / 2 + s * h * 0.45); g.stroke(); }
+    for (let i = 0; i < 3000; i++) { g.fillStyle = `rgba(${rng() < 0.5 ? '20,60,10' : '140,190,90'},${rng() * 0.15})`; g.fillRect(rng() * w, rng() * h, 2, 2); }
+  },
+  audio: { seed: 777, pitch: 1, style: 'apple' },
+  capSize: 2048,
+  capMat: { roughness: 0.35, clearcoat: 0.3, clearcoatRoughness: 0.16, sheen: 0.25, sheenColor: new THREE.Color('#fff6e0'), emissiveIntensity: 0, bumpScale: 0.25, envMapIntensity: 0.9 },
+  cap(g, S, k) {
+    const { P, path, U } = k;
+    g.fillStyle = '#9e0f1b'; g.fillRect(0, 0, S, S);
+    const [cx, cy] = P(0, 0.05);
+    const grd = g.createRadialGradient(cx, cy, 10, cx, cy, S * 0.52);
+    grd.addColorStop(0, '#f6ecd0'); grd.addColorStop(0.35, '#fbf5e4'); grd.addColorStop(0.8, '#f7f0d8'); grd.addColorStop(1, '#eef0c8');
+    g.fillStyle = grd; g.fill(path);
+    g.save(); g.clip(path);
+    for (let i = 0; i < 500; i++) { // soft mottling
+      const x = rng() * S, y = rng() * S, r = 20 + rng() * 90, gr = g.createRadialGradient(x, y, 0, x, y, r);
+      gr.addColorStop(0, rng() < 0.5 ? 'rgba(240,228,190,0.06)' : 'rgba(255,253,244,0.12)'); gr.addColorStop(1, 'rgba(0,0,0,0)');
+      g.fillStyle = gr; g.fillRect(x - r, y - r, 2 * r, 2 * r);
+    }
+    for (let i = 0; i < 60000; i++) { // flesh cells and tiny pores
+      const r = 0.7 + rng() * 1.8, dark = rng() < 0.55;
+      g.fillStyle = dark ? `rgba(226,208,160,${0.06 + rng() * 0.1})` : `rgba(255,255,250,${0.15 + rng() * 0.3})`;
+      g.beginPath(); g.ellipse(rng() * S, rng() * S, r, r * (0.6 + rng() * 0.4), rng() * 3.14, 0, Math.PI * 2); g.fill();
+    }
+    for (let i = 0; i < 5000; i++) { // faint fibres radiating from the core
+      const x = rng() * S, y = rng() * S, a = Math.atan2(y - cy, x - cx), l = 6 + rng() * 12;
+      g.strokeStyle = `rgba(222,200,150,${0.04 + rng() * 0.06})`; g.lineWidth = 1;
+      g.beginPath(); g.moveTo(x, y); g.lineTo(x + Math.cos(a) * l, y + Math.sin(a) * l); g.stroke();
+    }
+    for (let a = 0; a < Math.PI * 2; a += 0.015) { // dotted vascular ring around the core
+      const [x, y] = P(Math.sin(a) * 0.5, 0.04 + Math.cos(a) * 0.55);
+      g.fillStyle = `rgba(190,170,110,${0.25 + rng() * 0.3})`; g.beginPath(); g.arc(x, y, 1.5 + rng() * 1.5, 0, Math.PI * 2); g.fill();
+    }
+    const [kx, ky] = P(0, 0.04);
+    g.beginPath(); g.ellipse(kx, ky, U(0.28), U(0.34, 1), 0, 0, Math.PI * 2);
+    g.fillStyle = 'rgba(238,224,170,0.35)'; g.fill();
+    g.strokeStyle = 'rgba(190,165,105,0.45)'; g.lineWidth = 3;
+    const line = (pts) => { g.beginPath(); pts.forEach(([x, y], i) => { const [a, b] = P(x, y); i ? g.lineTo(a, b) : g.moveTo(a, b); }); g.stroke(); };
+    line([[0, 0.62], [0.01, 0.5], [0, 0.38]]); line([[0, -0.7], [-0.01, -0.5], [0, -0.3]]);
+    g.strokeStyle = 'rgba(190,165,105,0.22)'; g.lineWidth = 2;
+    for (const s of [-1, 1]) { line([[s * 0.06, 0.36], [s * 0.2, 0.5], [s * 0.1, 0.6]]); line([[s * 0.08, -0.28], [s * 0.22, -0.5], [s * 0.08, -0.68]]); }
+    for (const sx of [-1, 1]) { // seed chambers with parchment walls and a seed
+      const [x, y] = P(sx * 0.09, 0.03), ax = U(0.07), ay = U(0.17, 1);
+      g.save(); g.translate(x, y); g.rotate(sx * 0.25);
+      g.beginPath(); g.ellipse(0, 0, ax, ay, 0, 0, Math.PI * 2);
+      g.fillStyle = 'rgba(246,236,208,0.95)'; g.fill(); g.lineWidth = 3; g.strokeStyle = 'rgba(176,150,96,0.7)'; g.stroke();
+      g.strokeStyle = 'rgba(255,255,255,0.6)'; g.lineWidth = 2; g.beginPath(); g.ellipse(-ax * 0.25, -ay * 0.1, ax * 0.6, ay * 0.75, 0, 2.4, 4.2); g.stroke();
+      const sl = ay * 1.15;
+      g.beginPath(); g.moveTo(0, -sl * 0.5); g.quadraticCurveTo(ax * 0.95, sl * 0.15, 0, sl * 0.42); g.quadraticCurveTo(-ax * 0.95, sl * 0.15, 0, -sl * 0.5);
+      const sg = g.createLinearGradient(-ax, -sl / 2, ax, sl / 2);
+      sg.addColorStop(0, '#7a4018'); sg.addColorStop(0.6, '#3c1a08'); sg.addColorStop(1, '#1e0c04');
+      g.fillStyle = sg; g.fill();
+      g.fillStyle = 'rgba(255,220,180,0.55)'; g.beginPath(); g.ellipse(-ax * 0.25, -sl * 0.1, ax * 0.12, sl * 0.22, 0.2, 0, Math.PI * 2); g.fill();
+      g.restore();
+    }
+    const [bx, by] = P(0, -0.74); // calyx tube remnant
+    g.fillStyle = 'rgba(120,90,50,0.6)'; g.beginPath(); g.moveTo(bx - U(0.04), by); g.lineTo(bx + U(0.04), by); g.lineTo(bx, by - U(0.08, 1)); g.fill();
+    // greener layer, pink bleed and the thin skin itself
+    g.lineWidth = U(0.12); g.strokeStyle = 'rgba(236,240,196,0.35)'; g.stroke(path);
+    g.lineWidth = U(0.06); g.strokeStyle = 'rgba(232,150,140,0.22)'; g.stroke(path);
+    g.lineWidth = U(0.025); g.strokeStyle = 'rgba(210,60,70,0.45)'; g.stroke(path);
+    g.lineWidth = U(0.012); g.strokeStyle = '#8e0a18'; g.stroke(path);
+    for (let i = 0; i < 1500; i++) { g.fillStyle = `rgba(255,255,255,${0.4 + rng() * 0.4})`; const s = 0.8 + rng() * 1.2; g.fillRect(rng() * S, rng() * S, s, s); } // moisture glints
+    g.restore();
+  },
+  capBump(g, S) { // pores read as tiny pits
+    g.fillStyle = '#808080'; g.fillRect(0, 0, S, S);
+    for (let i = 0; i < 50000; i++) { g.fillStyle = `rgba(0,0,0,${0.15 + rng() * 0.2})`; g.beginPath(); g.arc(rng() * S, rng() * S, 0.7 + rng() * 1.1, 0, Math.PI * 2); g.fill(); }
+    for (let i = 0; i < 8000; i++) { g.fillStyle = `rgba(255,255,255,${0.2 + rng() * 0.3})`; g.beginPath(); g.arc(rng() * S, rng() * S, 1 + rng() * 1.5, 0, Math.PI * 2); g.fill(); }
+  },
+  capRough(g, S) { // wet, smoother patches over a satin base
+    g.fillStyle = '#7a7a7a'; g.fillRect(0, 0, S, S);
+    for (let i = 0; i < 400; i++) {
+      const x = rng() * S, y = rng() * S, r = 30 + rng() * 120, gr = g.createRadialGradient(x, y, 0, x, y, r);
+      gr.addColorStop(0, 'rgba(40,40,40,0.15)'); gr.addColorStop(1, 'rgba(0,0,0,0)');
+      g.fillStyle = gr; g.fillRect(x - r, y - r, 2 * r, 2 * r);
+    }
+  },
+};
+const CFG = FRUITS[FRUIT];
+
+// shared cap-painting bits
+function frost(g, S, tint) {
+  for (let i = 0; i < 7000; i++) {
+    g.fillStyle = rng() < 0.75 ? `rgba(255,255,255,${rng() * 0.45})` : `${tint}${rng() * 0.12})`;
+    const s = 0.6 + rng() * 2.2; g.fillRect(rng() * S, rng() * S, s, s);
+  }
+}
+function seeds(g, x0, y0, spread, len, c0, c1) {
+  for (const sx of [-1, 1]) {
+    g.save(); g.translate(x0 + sx * spread / 2, y0); g.rotate(sx * 0.35);
+    g.beginPath(); g.moveTo(0, -len * 0.55); g.quadraticCurveTo(len * 0.35, len * 0.2, 0, len * 0.45); g.quadraticCurveTo(-len * 0.35, len * 0.2, 0, -len * 0.55);
+    const sg = g.createLinearGradient(-len, -len, len, len); sg.addColorStop(0, c0); sg.addColorStop(1, c1);
+    g.fillStyle = sg; g.fill();
+    g.fillStyle = 'rgba(255,230,190,0.7)'; g.fillRect(-len * 0.09, -len * 0.28, len * 0.06, len * 0.28);
+    g.restore();
+  }
+}
+
+const PROFILE = CFG.profile();
+let BOTTOM_Y = Infinity, R0 = 0, TOP_Y = -Infinity, MAX_R = 0;
+for (const p of PROFILE) { if (p.y < BOTTOM_Y) { BOTTOM_Y = p.y; R0 = p.x; } TOP_Y = Math.max(TOP_Y, p.y); MAX_R = Math.max(MAX_R, p.x); }
+const AXIS_TOP = PROFILE[PROFILE.length - 1].y;
+// outer radius of the fruit at height y
+function outerR(y) {
+  let best = 0;
+  for (let i = 0; i < PROFILE.length - 1; i++) {
+    const a = PROFILE[i], b = PROFILE[i + 1];
+    if ((a.y - y) * (b.y - y) <= 0 && a.y !== b.y) best = Math.max(best, lerp(a.x, b.x, (y - a.y) / (b.y - a.y)));
+  }
+  return best;
+}
+
+// ---------- renderer ----------
+const renderer = new THREE.WebGLRenderer({ antialias: true, preserveDrawingBuffer: true });
+renderer.setPixelRatio(1);
+renderer.setSize(W, H);
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.05;
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+renderer.localClippingEnabled = true;
+document.body.appendChild(renderer.domElement);
+const gl = renderer.getContext();
+const dbg = gl.getExtension('WEBGL_debug_renderer_info');
+window.glInfo = dbg ? gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL) : 'unknown';
+
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(24, W / H, 0.1, 100);
+
+// ---------- studio environment: dark room with softbox strips (gives the glossy streak highlights) ----------
+function makeEnv() {
+  const s = new THREE.Scene();
+  s.add(new THREE.Mesh(new THREE.BoxGeometry(24, 24, 24), new THREE.MeshBasicMaterial({ color: 0x18181a, side: THREE.BackSide })));
+  const panel = (w, h, x, y, z, k, tint = 0xffffff) => {
+    const m = new THREE.Mesh(new THREE.PlaneGeometry(w, h), new THREE.MeshBasicMaterial({ color: new THREE.Color(tint).multiplyScalar(k), side: THREE.DoubleSide }));
+    m.position.set(x, y, z); m.lookAt(0, 0, 0); s.add(m);
+  };
+  panel(9, 3.5, 0, 10, 3, 7);          // top softbox
+  panel(2.2, 9, -9, 2, 6, 6);          // left strip -> long vertical streak
+  panel(1.2, 7, 9, 3, 2, 3.5);         // right rim strip
+  panel(7, 4, 0, 1, -10, 0.9, 0xd8d4cf); // back wall
+  panel(14, 14, 0, -11, 0, 0.5, 0x7a4a2a); // warm bounce from the board
+  panel(16, 9, 2, 3, 11, 2.6, 0xe8ecf0);   // big soft panel behind the camera (what the blade reflects)
+  const pmrem = new THREE.PMREMGenerator(renderer);
+  return pmrem.fromScene(s, 0.015).texture;
+}
+scene.environment = makeEnv();
+scene.environmentIntensity = 1.0;
+
+// ---------- lights ----------
+const key = new THREE.DirectionalLight(0xfff4e8, 2.4);
+key.position.set(-4, 7, 5);
+key.castShadow = true;
+key.shadow.mapSize.set(2048, 2048);
+Object.assign(key.shadow.camera, { left: -4, right: 4, top: 4, bottom: -4, near: 0.5, far: 25 });
+key.shadow.bias = -0.0004; key.shadow.normalBias = 0.02;
+scene.add(key);
+const rim = new THREE.SpotLight(0xffffff, 40, 20, deg(30), 0.6);
+rim.position.set(5, 4, -4);
+scene.add(rim);
+
+// ---------- canvas textures ----------
+function canvasTex(w, h, draw, srgb = true) {
+  const c = document.createElement('canvas'); c.width = w; c.height = h;
+  draw(c.getContext('2d'), w, h);
+  const t = new THREE.CanvasTexture(c);
+  if (srgb) t.colorSpace = THREE.SRGBColorSpace;
+  t.anisotropy = 16;
+  return t;
+}
+const woodTex = canvasTex(2048, 2048, (g, S) => {
+  g.fillStyle = '#4a2c18'; g.fillRect(0, 0, S, S);
+  for (let i = 0; i < 900; i++) {
+    const y0 = rng() * S, amp = 4 + rng() * 22, f = 0.002 + rng() * 0.004, ph = rng() * 6.28, light = rng() < 0.5;
+    g.strokeStyle = light ? `rgba(150,96,58,${0.05 + rng() * 0.12})` : `rgba(22,10,4,${0.05 + rng() * 0.16})`;
+    g.lineWidth = 1 + rng() * 5;
+    g.beginPath();
+    for (let x = 0; x <= S; x += 16) { const y = y0 + Math.sin(x * f + ph) * amp + Math.sin(x * f * 3.1 + ph * 2) * amp * 0.3; x ? g.lineTo(x, y) : g.moveTo(x, y); }
+    g.stroke();
+  }
+  for (let i = 0; i < 260; i++) { // knife scratches
+    g.strokeStyle = `rgba(205,170,135,${0.04 + rng() * 0.1})`; g.lineWidth = 0.6 + rng() * 1.2;
+    const x = rng() * S, y = rng() * S, a = rng() * Math.PI, l = 40 + rng() * 300;
+    g.beginPath(); g.moveTo(x, y); g.lineTo(x + Math.cos(a) * l, y + Math.sin(a) * l); g.stroke();
+  }
+});
+const backdropTex = canvasTex(512, 512, (g, S) => {
+  const grd = g.createRadialGradient(S * 0.45, S * 0.3, 10, S * 0.5, S * 0.5, S * 0.75);
+  grd.addColorStop(0, '#c9c5c0'); grd.addColorStop(0.5, '#9b9894'); grd.addColorStop(1, '#4e4c4a');
+  g.fillStyle = grd; g.fillRect(0, 0, S, S);
+});
+
+// ---------- board + backdrop ----------
+const board = new THREE.Mesh(new THREE.BoxGeometry(14, 0.3, 14),
+  new THREE.MeshPhysicalMaterial({ map: woodTex, roughness: 0.55, clearcoat: 0.3, clearcoatRoughness: 0.45 }));
+board.position.set(0, -0.15, -1.5);
+board.receiveShadow = true;
+scene.add(board);
+const backdrop = new THREE.Mesh(new THREE.PlaneGeometry(34, 20), new THREE.MeshBasicMaterial({ map: backdropTex }));
+backdrop.position.set(0, 4, -8);
+scene.add(backdrop);
+
+// ---------- cut frame: local x = 0 is the cutting plane ----------
+const cutGroup = new THREE.Group();
+cutGroup.rotation.y = deg(-50);
+cutGroup.position.y = -BOTTOM_Y;
+scene.add(cutGroup);
+
+// natural unevenness: a lopsided body and five soft lobes at the base, fading to zero at the cut plane
+function lumpOffset(x, y, z) {
+  const a = Math.atan2(x, z), r = Math.hypot(x, z);
+  const fade = smooth(seg(Math.abs(x), 0, 0.25)) * smooth(seg(r, 0.1, 0.4));
+  return fade * (0.018 * Math.cos(5 * a + 0.4) * smooth(seg(-y, 0.15, 0.75))
+    + 0.012 * Math.sin(2 * a + 1.3) * Math.sin(Math.PI * seg(y, -0.8, 0.8))
+    + 0.006 * Math.sin(3 * a + y * 4));
+}
+function weldLatheSeam(geo, segs) {
+  const n = geo.attributes.normal, np = PROFILE.length;
+  for (let j = 0; j < np; j++) {
+    const a = j, b = segs * np + j;
+    const nx = n.getX(a) + n.getX(b), ny = n.getY(a) + n.getY(b), nz = n.getZ(a) + n.getZ(b), l = Math.hypot(nx, ny, nz) || 1;
+    n.setXYZ(a, nx / l, ny / l, nz / l); n.setXYZ(b, nx / l, ny / l, nz / l);
+  }
+}
+function lumpLathe(geo, segs) {
+  const p = geo.attributes.position, n = geo.attributes.normal;
+  for (let i = 0; i < p.count; i++) {
+    const d = lumpOffset(p.getX(i), p.getY(i), p.getZ(i));
+    p.setXYZ(i, p.getX(i) + n.getX(i) * d, p.getY(i) + n.getY(i) * d, p.getZ(i) + n.getZ(i) * d);
+  }
+  geo.computeVertexNormals();
+  weldLatheSeam(geo, segs);
+}
+
+// fruit skin geometry with painted vertex colours
+const fruitGeo = new THREE.LatheGeometry(PROFILE, 180);
+if (CFG.lumpy) lumpLathe(fruitGeo, 180);
+{
+  const pos = fruitGeo.attributes.position, cols = new Float32Array(pos.count * 3), c = new THREE.Color();
+  for (let i = 0; i < pos.count; i++) {
+    const x = pos.getX(i), y = pos.getY(i), z = pos.getZ(i);
+    CFG.colour(x, y, z, Math.atan2(x, z), c);
+    cols.set([c.r, c.g, c.b], i * 3);
+  }
+  fruitGeo.setAttribute('color', new THREE.BufferAttribute(cols, 3));
+}
+const { sheenColor, ...skinParams } = CFG.skin;
+const skinMat = new THREE.MeshPhysicalMaterial({ vertexColors: true, ior: 1.5, specularIntensity: 1, ...skinParams, sheenColor: new THREE.Color(sheenColor) });
+if (CFG.skinMap) skinMat.map = canvasTex(2048, 1024, CFG.skinMap);
+if (CFG.bumpMap) skinMat.bumpMap = canvasTex(2048, 1024, CFG.bumpMap, false);
+if (CFG.roughMap) skinMat.roughnessMap = canvasTex(2048, 1024, CFG.roughMap, false);
+
+// cross-section "cap": the profile mirrored, lying in the cut plane
+const capShapePts = [...PROFILE.map(p => new THREE.Vector2(p.x, p.y)), ...PROFILE.slice().reverse().map(p => new THREE.Vector2(-p.x, p.y))];
+const capBox = new THREE.Box2().setFromPoints(capShapePts);
+const CAP_S = CFG.capSize || 1024;
+const capCanvas = (draw, srgb = true) => canvasTex(CAP_S, CAP_S, (g, S) => {
+  const w = capBox.max.x - capBox.min.x, h = capBox.max.y - capBox.min.y;
+  const P = (x, y) => [(x - capBox.min.x) / w * S, (1 - (y - capBox.min.y) / h) * S];
+  const U = (d, vertical) => d / (vertical ? h : w) * S; // fruit units -> pixels
+  const path = new Path2D();
+  capShapePts.forEach((p, i) => { const [a, b] = P(p.x, p.y); i ? path.lineTo(a, b) : path.moveTo(a, b); });
+  path.closePath();
+  draw(g, S, { P, U, path, outerR });
+}, srgb);
+const capTex = capCanvas(CFG.cap);
+function makeCapGeo(sign) {
+  const geo = new THREE.ShapeGeometry(new THREE.Shape(capShapePts.map(p => p.clone().multiplyScalar(0.997))), 1);
+  const pos = geo.attributes.position, uv = geo.attributes.uv;
+  const w = capBox.max.x - capBox.min.x, h = capBox.max.y - capBox.min.y;
+  for (let i = 0; i < pos.count; i++) uv.setXY(i, (pos.getX(i) - capBox.min.x) / w, (pos.getY(i) - capBox.min.y) / h);
+  geo.rotateY(-sign * Math.PI / 2); // faces -sign*x, i.e. out of the cut
+  geo.translate(sign * 0.0015, 0, 0);
+  return geo;
+}
+const capMat = new THREE.MeshPhysicalMaterial({
+  map: capTex, emissiveMap: capTex, emissive: 0xffffff, emissiveIntensity: 0.035,
+  roughness: 0.45, clearcoat: 0.5, clearcoatRoughness: 0.08, sheen: 0.5, sheenColor: new THREE.Color('#fff0e0'),
+  ...CFG.capMat,
+});
+if (CFG.capBump) capMat.bumpMap = capCanvas(CFG.capBump, false);
+if (CFG.capRough) capMat.roughnessMap = capCanvas(CFG.capRough, false);
+
+// stem (bends away from the knife, toward -x), optional calyx, leaf
+const stemCurve = new THREE.CatmullRomCurve3(CFG.stem.pts(AXIS_TOP).map(([x, y], i) => new THREE.Vector3(x, y, i * 0.01)));
+const stemGeo = new THREE.TubeGeometry(stemCurve, 32, CFG.stem.radius, 12, false);
+const stemMat = new THREE.MeshPhysicalMaterial({ color: CFG.stem.color, roughness: 0.12, clearcoat: 1, clearcoatRoughness: 0.05 });
+let calyxGeo = null, calyxMat = null;
+if (CFG.calyx) {
+  const cs = new THREE.Shape();
+  for (let i = 0; i <= 10; i++) { const a = i / 10 * Math.PI * 2, r = i % 2 ? 0.07 : 0.2; i ? cs.lineTo(Math.cos(a) * r, Math.sin(a) * r) : cs.moveTo(r, 0); }
+  calyxGeo = new THREE.ExtrudeGeometry(cs, { depth: 0.02, bevelEnabled: true, bevelThickness: 0.015, bevelSize: 0.015, bevelSegments: 2 });
+  calyxGeo.rotateX(-Math.PI / 2);
+  calyxGeo.translate(0, AXIS_TOP + 0.005, 0);
+  calyxMat = new THREE.MeshPhysicalMaterial({ color: CFG.calyx.color, roughness: 0.1, clearcoat: 1 });
+}
+const leafShape = new THREE.Shape();
+leafShape.moveTo(0, 0); leafShape.quadraticCurveTo(0.24, 0.2, 0.78, 0); leafShape.quadraticCurveTo(0.24, -0.2, 0, 0);
+const leafGeo = new THREE.ShapeGeometry(leafShape, 20);
+{
+  const p = leafGeo.attributes.position;
+  for (let i = 0; i < p.count; i++) { const x = p.getX(i), y = p.getY(i); p.setZ(i, -0.35 * x * x + 1.6 * y * y); }
+  leafGeo.computeVertexNormals();
+}
+const leafMat = new THREE.MeshPhysicalMaterial({
+  color: CFG.leaf.color, roughness: 0.06, clearcoat: 1, transmission: 0.35, thickness: 0.05, ior: 1.5, side: THREE.DoubleSide,
+});
+if (CFG.leafMap) { // shape coords run x 0..0.78, y -0.2..0.2
+  const t = canvasTex(1024, 512, CFG.leafMap);
+  t.repeat.set(1 / 0.78, 2.5); t.offset.set(0, 0.5);
+  Object.assign(leafMat, { map: t, color: new THREE.Color(0xffffff), roughness: 0.45, clearcoat: 0.3, transmission: 0.1 });
+}
+
+// build the two halves: sign +1 keeps x >= 0 (front half, falls open), -1 keeps x <= 0
+function makeHalf(sign) {
+  const pivot = new THREE.Group(), holder = new THREE.Group();
+  pivot.position.set(sign * R0, BOTTOM_Y, 0);
+  holder.position.set(-sign * R0, -BOTTOM_Y, 0);
+  pivot.add(holder); cutGroup.add(pivot);
+  const plane = new THREE.Plane(), localPlane = new THREE.Plane(new THREE.Vector3(sign, 0, 0), 0);
+  const clip = m => { const c = m.clone(); c.clippingPlanes = [plane]; c.clipShadows = true; return c; };
+  // the front half ends up face-up under the top softbox, so its cut face reflects less
+  const cm = sign > 0 ? Object.assign(capMat.clone(), { envMapIntensity: 0.45, clearcoat: 0.2, color: new THREE.Color(0.8, 0.8, 0.8) }) : capMat;
+  const parts = [new THREE.Mesh(fruitGeo, clip(skinMat)), new THREE.Mesh(makeCapGeo(sign), cm), new THREE.Mesh(stemGeo, clip(stemMat))];
+  if (calyxGeo) parts.push(new THREE.Mesh(calyxGeo, clip(calyxMat)));
+  for (const m of parts) { m.castShadow = true; m.receiveShadow = true; holder.add(m); }
+  // surface samples used to keep the half resting on the board
+  const samples = [];
+  const p = fruitGeo.attributes.position;
+  for (let i = 0; i < p.count; i += 3) if (sign * p.getX(i) >= -1e-3) samples.push(new THREE.Vector3(p.getX(i), p.getY(i), p.getZ(i)));
+  return { sign, pivot, holder, plane, localPlane, samples };
+}
+const front = makeHalf(1), back = makeHalf(-1);
+const leaf = new THREE.Mesh(leafGeo, leafMat);
+leaf.position.copy(stemCurve.getPoint(CFG.leaf.at)).add(new THREE.Vector3(...CFG.leaf.offset));
+leaf.rotation.set(-0.5, -2.4, 0.45);
+leaf.scale.setScalar(CFG.leaf.scale);
+leaf.castShadow = true;
+back.holder.add(leaf);
+
+// tiny juice beads sitting on each cut face
+if (CFG.juice) {
+  const beadMat = new THREE.MeshPhysicalMaterial({ color: 0xffffff, transmission: 1, thickness: 0.01, roughness: 0, ior: 1.33, specularIntensity: 1, envMapIntensity: 1.5 });
+  const beadGeo = new THREE.SphereGeometry(1, 12, 8);
+  const m = new THREE.Matrix4(), q = new THREE.Quaternion(), s = new THREE.Vector3(), p = new THREE.Vector3();
+  for (const h of [front, back]) {
+    const im = new THREE.InstancedMesh(beadGeo, beadMat, 45);
+    for (let i = 0; i < 45; i++) {
+      const y = lerp(BOTTOM_Y + 0.15, TOP_Y - 0.1, rng()), r = 0.004 + rng() * rng() * 0.014;
+      p.set(h.sign * 0.0015, y, (rng() * 2 - 1) * outerR(y) * 0.85);
+      im.setMatrixAt(i, m.compose(p, q, s.set(r * 0.35, r, r)));
+    }
+    h.holder.add(im);
+  }
+}
+
+// ---------- knife (blade lies in the cut plane, tip toward +z, handle toward -z) ----------
+const knife = new THREE.Group();
+cutGroup.add(knife);
+{
+  const ks = new THREE.Shape();
+  ks.moveTo(-2.0, 0.06); ks.quadraticCurveTo(-1.2, -0.02, 0, 0); ks.lineTo(1.5, 0); ks.lineTo(1.5, 0.74); ks.lineTo(-0.4, 0.74); ks.quadraticCurveTo(-1.5, 0.68, -2.0, 0.06);
+  const bg = new THREE.ExtrudeGeometry(ks, { depth: 0.014, bevelEnabled: true, bevelThickness: 0.006, bevelSize: 0.006, bevelSegments: 2, curveSegments: 32 });
+  bg.translate(0, 0, -0.007); bg.rotateY(Math.PI / 2);
+  const brushed = canvasTex(1024, 1024, (g, S) => {
+    g.fillStyle = '#808080'; g.fillRect(0, 0, S, S);
+    for (let i = 0; i < 1500; i++) { g.fillStyle = `rgba(${rng() < 0.5 ? '255,255,255' : '0,0,0'},${rng() * 0.12})`; g.fillRect(0, rng() * S, S, 0.5 + rng() * 2); }
+  }, false);
+  const blade = new THREE.Mesh(bg, new THREE.MeshPhysicalMaterial({ color: '#e6eaee', metalness: 1, roughness: 0.32, roughnessMap: brushed, clearcoat: 0.2 }));
+  const hs = new THREE.Shape();
+  const r = 0.12; hs.moveTo(1.6 + r, 0.12); hs.lineTo(3.2 - r, 0.12); hs.quadraticCurveTo(3.2, 0.12, 3.2, 0.12 + r); hs.lineTo(3.2, 0.62 - r);
+  hs.quadraticCurveTo(3.2, 0.62, 3.2 - r, 0.62); hs.lineTo(1.6 + r, 0.62); hs.quadraticCurveTo(1.6, 0.62, 1.6, 0.62 - r); hs.lineTo(1.6, 0.12 + r); hs.quadraticCurveTo(1.6, 0.12, 1.6 + r, 0.12);
+  const hg = new THREE.ExtrudeGeometry(hs, { depth: 0.12, bevelEnabled: true, bevelThickness: 0.04, bevelSize: 0.04, bevelSegments: 4 });
+  hg.translate(0, 0, -0.06); hg.rotateY(Math.PI / 2);
+  const handle = new THREE.Mesh(hg, new THREE.MeshPhysicalMaterial({ color: '#141414', roughness: 0.25, clearcoat: 1, clearcoatRoughness: 0.1 }));
+  const steel = new THREE.MeshPhysicalMaterial({ color: '#cfd3d8', metalness: 1, roughness: 0.15 });
+  const bolster = new THREE.Mesh(new THREE.BoxGeometry(0.1, 0.62, 0.14), steel);
+  bolster.position.set(0, 0.4, -1.57);
+  knife.add(blade, handle, bolster);
+  for (const z of [-1.95, -2.4, -2.85]) {
+    const rv = new THREE.Mesh(new THREE.CylinderGeometry(0.035, 0.035, 0.22, 16), steel);
+    rv.rotation.z = Math.PI / 2; rv.position.set(0, 0.37, z); knife.add(rv);
+  }
+  knife.traverse(o => { if (o.isMesh) o.castShadow = true; });
+}
+// realistic cut: the blade presses into the skin, breaks through, glides, meets a little resistance at the core,
+// then eases onto the board. Speed profile integrated into a depth-vs-time table.
+const CUT_N = 2000;
+const CUT_TABLE = (() => {
+  const out = [0]; let acc = 0;
+  for (let i = 1; i <= CUT_N; i++) {
+    const u = i / CUT_N;
+    let s = u < 0.06 ? 0.25 : lerp(0.25, 1.1, smooth(seg(u, 0.06, 0.14)));
+    s *= smooth(seg(u, 0, 0.03));
+    s *= 1 - 0.18 * Math.exp(-(((u - 0.55) / 0.1) ** 2));
+    s *= lerp(1, 0.35, smooth(seg(u, 0.93, 1)));
+    acc += s; out.push(acc);
+  }
+  return out.map(v => v / acc);
+})();
+function cutDepth(u) {
+  const f = clamp(u, 0, 1) * CUT_N, i = Math.floor(f);
+  return i >= CUT_N ? 1 : lerp(CUT_TABLE[i], CUT_TABLE[i + 1], f - i);
+}
+T.skinBreak = T.touch + 0.1 * (T.cutEnd - T.touch);
+function knifeState(t) {
+  let y, z = 0, tilt = 0.05;
+  const top = TOP_Y + 0.02, crackDepth = TOP_Y - 0.14, high = TOP_Y + 2.9;
+  if (CFG.smoothCut) { // one continuous glide, like cutting butter
+    tilt = 0.03;
+    if (t < T.approachStart) y = high;
+    else if (t < T.touch) y = lerp(high, top, easeOut(seg(t, T.approachStart, T.touch)));
+    else if (t < T.cutEnd) {
+      const u = seg(t, T.touch, T.cutEnd), p = CFG.realCut ? cutDepth(u) : easeInOutSine(u);
+      y = lerp(top, BOTTOM_Y, p); z = lerp(0.3, -0.3, easeInOutSine(u)); tilt = 0.03 * (1 - p);
+    } else if (t < T.lift) { y = BOTTOM_Y; z = -0.3; tilt = 0; }
+    else { y = lerp(BOTTOM_Y, high + 1, easeIn(seg(t, T.lift, T.liftEnd))); z = -0.3; tilt = -0.08 * seg(t, T.lift, T.liftEnd); }
+    return { y, z, tilt };
+  }
+  if (t < T.approachStart) y = high;
+  else if (t < T.approachEnd) y = lerp(high, top + 0.08, easeOut(seg(t, T.approachStart, T.approachEnd)));
+  else if (t < T.touch) y = lerp(top + 0.08, top, smooth(seg(t, T.approachEnd, T.touch)));
+  else if (t < T.crack) y = top - 0.012 * seg(t, T.touch, T.crack);
+  else if (t < T.cutStart) y = lerp(top - 0.012, crackDepth, easeOut(seg(t, T.crack, T.cutStart)));
+  else if (t < T.cutEnd) {
+    const p = seg(t, T.cutStart, T.cutEnd);
+    y = lerp(crackDepth, BOTTOM_Y, 0.15 * p + 0.85 * easeInOutSine(p));
+    z = 0.14 * Math.sin(2 * Math.PI * 1.4 * (t - T.cutStart));
+    tilt = 0.05 * (1 - p);
+  } else if (t < T.lift) { y = BOTTOM_Y; tilt = 0; }
+  else { y = lerp(BOTTOM_Y, high + 1, easeIn(seg(t, T.lift, T.liftEnd))); tilt = -0.08 * seg(t, T.lift, T.liftEnd); }
+  return { y, z, tilt };
+}
+const cutProgress = t => clamp((TOP_Y - knifeState(Math.min(t, T.cutEnd)).y) / (TOP_Y - BOTTOM_Y), 0, 1);
+
+// ---------- crack flash ----------
+const flash = new THREE.Sprite(new THREE.SpriteMaterial({
+  map: canvasTex(256, 256, (g, S) => {
+    const gr = g.createRadialGradient(S / 2, S / 2, 0, S / 2, S / 2, S / 2);
+    gr.addColorStop(0, 'rgba(255,255,255,1)'); gr.addColorStop(0.15, 'rgba(255,250,235,0.6)'); gr.addColorStop(1, 'rgba(255,240,220,0)');
+    g.fillStyle = gr; g.fillRect(0, 0, S, S);
+    g.strokeStyle = 'rgba(255,255,255,0.9)'; g.lineWidth = 2;
+    for (let i = 0; i < 4; i++) { const a = i * Math.PI / 4; g.beginPath(); g.moveTo(S / 2 - Math.cos(a) * S / 2, S / 2 - Math.sin(a) * S / 2); g.lineTo(S / 2 + Math.cos(a) * S / 2, S / 2 + Math.sin(a) * S / 2); g.stroke(); }
+  }),
+  blending: THREE.AdditiveBlending, depthWrite: false, depthTest: false, transparent: true,
+}));
+flash.position.copy(cutGroup.localToWorld(new THREE.Vector3(0, TOP_Y + 0.02, 0)));
+scene.add(flash);
+
+// ---------- glass shards (deterministic particle sim) ----------
+const shardGeo = new THREE.TetrahedronGeometry(1, 0);
+const shardMat = new THREE.MeshPhysicalMaterial({ color: 0xffffff, transmission: 0.45, thickness: 0.2, roughness: 0.04, ior: 1.52, clearcoat: 1, iridescence: 0.5, specularIntensity: 1, envMapIntensity: 3, flatShading: true });
+const spawns = [];
+const tmpV = new THREE.Vector3();
+cutGroup.updateMatrixWorld(true);
+function addSpawn(t, lp, lv, size, tinted) {
+  const p = cutGroup.localToWorld(lp.clone());
+  const v = lv.clone().applyQuaternion(cutGroup.quaternion);
+  size *= 1.6;
+  spawns.push({ t, p, v, size, tinted, sx: 0.5 + rng(), sy: 0.3 + rng() * 0.8, sz: 0.6 + rng(),
+    axis: new THREE.Vector3(rng() - 0.5, rng() - 0.5, rng() - 0.5).normalize(), w: (rng() * 2 - 1) * 25, a0: rng() * 6.28 });
+}
+if (CFG.shards !== false) {
+for (let i = 0; i < 70; i++) addSpawn(T.crack + rng() * 0.06, new THREE.Vector3(rng() * 0.04 - 0.02, TOP_Y + 0.01, (rng() * 2 - 1) * 0.3),
+  new THREE.Vector3((rng() * 2 - 1) * 1.4, 1.5 + rng() * 3.2, (rng() * 2 - 1) * 1.4), 0.012 + rng() * rng() * 0.04, rng() < 0.45);
+for (let i = 0; i < 170; i++) {
+  const t = lerp(T.cutStart, T.cutEnd, rng()), y = knifeState(t).y, side = rng() < 0.5 ? 1 : -1;
+  addSpawn(t, new THREE.Vector3(rng() * 0.04 - 0.02, y, side * outerR(y) * 1.01),
+    new THREE.Vector3((rng() * 2 - 1) * 0.6, 0.2 + rng() * 1.4, side * (0.4 + rng() * 1.4)), 0.008 + rng() * rng() * 0.026, rng() < 0.4);
+}
+for (let i = 0; i < 30; i++) addSpawn(T.cutEnd + rng() * 0.05, new THREE.Vector3(rng() * 0.06 - 0.03, BOTTOM_Y + 0.02, (rng() * 2 - 1) * 0.9),
+  new THREE.Vector3((rng() * 2 - 1) * 0.8, 0.3 + rng() * 1.2, (rng() * 2 - 1) * 0.8), 0.008 + rng() * 0.015, rng() < 0.3);
+for (let i = 0; i < 40; i++) addSpawn(T.land + rng() * 0.08, new THREE.Vector3(0.9 + rng() * 0.5, BOTTOM_Y + 0.02, (rng() * 2 - 1) * 0.8),
+  new THREE.Vector3((rng() * 2 - 1) * 0.9, 0.5 + rng() * 1.1, (rng() * 2 - 1) * 0.9), 0.008 + rng() * 0.02, rng() < 0.4);
+}
+
+const shards = new THREE.InstancedMesh(shardGeo, shardMat, spawns.length);
+shards.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+{
+  const clear = new THREE.Color('#ffffff'), tint = new THREE.Color(CFG.shard);
+  spawns.forEach((s, i) => shards.setColorAt(i, s.tinted ? tint : clear));
+}
+scene.add(shards);
+
+const G = -22, DT = 1 / 480;
+const fruitInv = new THREE.Matrix4().copy(cutGroup.matrixWorld).invert();
+let sim = null;
+function resetSim() {
+  sim = { t: 0, impacts: [], st: spawns.map(s => ({ live: false, p: s.p.clone(), v: s.v.clone(), ang: s.a0, w: s.w, rest: false })) };
+}
+function stepSim(tEnd) {
+  if (!sim || tEnd < sim.t) resetSim();
+  const lp = new THREE.Vector3();
+  while (sim.t < tEnd) {
+    sim.t += DT;
+    for (let i = 0; i < spawns.length; i++) {
+      const s = spawns[i], st = sim.st[i];
+      if (sim.t < s.t) continue;
+      st.live = true;
+      if (st.rest) continue;
+      st.v.y += G * DT;
+      st.p.addScaledVector(st.v, DT);
+      st.ang += st.w * DT;
+      // collide with the intact fruit
+      if (sim.t < T.fallStart) {
+        lp.copy(st.p).applyMatrix4(fruitInv);
+        if (lp.y > BOTTOM_Y && lp.y < TOP_Y) {
+          const r = Math.hypot(lp.x, lp.z), R = outerR(lp.y);
+          if (r < R && r > 1e-4) {
+            const n = tmpV.set(lp.x / r, 0, lp.z / r).applyQuaternion(cutGroup.quaternion);
+            st.p.addScaledVector(n, R - r);
+            const vn = st.v.dot(n);
+            if (vn < 0) st.v.addScaledVector(n, -1.3 * vn);
+          }
+        }
+      }
+      const floor = s.size * 0.4;
+      if (st.p.y < floor) {
+        st.p.y = floor;
+        if (st.v.y < 0) {
+          const speed = -st.v.y;
+          if (speed > 0.5) sim.impacts.push({ t: sim.t, v: speed, size: s.size, x: st.p.x });
+          st.v.y = speed * 0.32; st.v.x *= 0.55; st.v.z *= 0.55; st.w *= 0.5;
+          if (st.v.y < 0.25) { st.rest = true; st.v.set(0, 0, 0); }
+        }
+      }
+    }
+  }
+}
+const dummy = new THREE.Object3D();
+function updateShards(t) {
+  stepSim(t);
+  spawns.forEach((s, i) => {
+    const st = sim.st[i];
+    if (!st.live) dummy.scale.setScalar(0);
+    else { dummy.position.copy(st.p); dummy.quaternion.setFromAxisAngle(s.axis, st.ang); dummy.scale.set(s.size * s.sx, s.size * s.sy, s.size * s.sz); }
+    dummy.updateMatrix();
+    shards.setMatrixAt(i, dummy.matrix);
+  });
+  shards.instanceMatrix.needsUpdate = true;
+}
+
+// ---------- halves animation ----------
+const wv = new THREE.Vector3();
+function placeHalf(h, angle, slide, sideways = 0) {
+  h.pivot.position.set(h.sign * (R0 + slide), BOTTOM_Y, -sideways);
+  h.pivot.rotation.z = -h.sign * angle;
+  h.pivot.updateMatrixWorld(true);
+  let minY = Infinity;
+  for (const p of h.samples) minY = Math.min(minY, wv.copy(p).applyMatrix4(h.holder.matrixWorld).y);
+  h.pivot.position.y -= minY; // rest on the board
+  h.pivot.updateMatrixWorld(true);
+  h.plane.copy(h.localPlane).applyMatrix4(h.holder.matrixWorld);
+}
+function frontFall(t) {
+  if (t < T.fallStart) return 0;
+  if (t < T.land) return Math.PI / 2 * Math.pow(seg(t, T.fallStart, T.land), 2);
+  const u = t - T.land;
+  return Math.PI / 2 - (CFG.smoothCut ? 0.06 : 0.16) * Math.exp(-5 * u) * Math.abs(Math.sin(11 * u));
+}
+
+// ---------- honey: glaze with running drips, puddle, smear on the blade, stretching strands ----------
+let updateHoney = () => {}, precomputeHoney = () => {}, honeyBreaks = [];
+if (CFG.honey) {
+  const honeyMat = new THREE.MeshPhysicalMaterial({
+    color: '#f2a41c', transmission: 0.55, thickness: 0.1, attenuationColor: new THREE.Color('#f09a18'), attenuationDistance: 0.6,
+    roughness: 0.02, ior: 1.49, specularIntensity: 1, clearcoat: 1, clearcoatRoughness: 0.02, envMapIntensity: 1.3,
+    emissive: '#7a3a00', emissiveIntensity: 0.25,
+  });
+  // the glaze over the apple is thinner and clearer than pooled honey, so the red shows through
+  const glazeMat = Object.assign(honeyMat.clone(), CFG.lumpy ? {
+    // realistic: an almost clear film, tinted golden per-vertex only where honey gathers
+    color: new THREE.Color(0xffffff), vertexColors: true, transmission: 0.95, thickness: 0.05, attenuationColor: new THREE.Color('#f2a020'),
+    attenuationDistance: 1.5, emissiveIntensity: 0.03, roughness: 0.05, clearcoat: 0, envMapIntensity: 0.9,
+  } : {
+    color: new THREE.Color('#ffd27a'), transmission: 0.92, thickness: 0.06, attenuationColor: new THREE.Color('#f2a020'),
+    attenuationDistance: 0.3, emissiveIntensity: 0.06,
+  });
+  const backGlow = new THREE.SpotLight(0xffb050, 35, 20, deg(35), 0.7);
+  backGlow.position.set(-3, 3.5, -5);
+  scene.add(backGlow);
+
+  // glaze shell = lathe pushed out along its normals by a varying honey thickness
+  const SEGS = 220;
+  const honeyGeo = new THREE.LatheGeometry(PROFILE, SEGS);
+  if (CFG.lumpy) lumpLathe(honeyGeo, SEGS);
+  const base = honeyGeo.attributes.position.array.slice(), nrm = honeyGeo.attributes.normal.array.slice();
+  const glazeCols = new THREE.BufferAttribute(new Float32Array(honeyGeo.attributes.position.count * 3), 3);
+  honeyGeo.setAttribute('color', glazeCols);
+  const clearTint = new THREE.Color(1, 0.97, 0.9), goldTint = new THREE.Color(1, 0.68, 0.2), tint = new THREE.Color();
+  const drips = Array.from({ length: 10 }, (_, i) => ({ a: (i + rng() * 0.6) / 10 * Math.PI * 2, w: 0.07 + rng() * 0.05, y0: 0.4 + rng() * 0.2, len: 0.3 + rng() * 0.6, speed: 0.03 + rng() * 0.05 }));
+  function honeyThickness(x, y, z, t) {
+    const r = Math.hypot(x, z), a = Math.atan2(x, z);
+    let th = 0.014 + 0.01 * smooth(seg(-y, -0.1, 0.7)) + (y > 0 ? 0.09 * Math.exp(-Math.pow(r / 0.22, 2)) : 0);
+    for (const d of drips) {
+      let da = Math.abs(a - d.a); if (da > Math.PI) da = 2 * Math.PI - da;
+      const s = da * Math.max(r, 0.2);
+      if (s > d.w * 2.5) continue;
+      const yEnd = Math.max(BOTTOM_Y + 0.15, d.y0 - d.len - d.speed * t);
+      const q = 1 - (s / d.w) ** 2;
+      if (y < d.y0 && y > yEnd && q > 0) th += 0.022 * Math.sqrt(q) * smooth(seg(d.y0 - y, 0, 0.15));
+      const by = (y - yEnd) / (d.w * 1.1), bs = s / (d.w * 1.1);
+      th += 0.03 * Math.exp(-(by * by + bs * bs)); // drop gathering at the drip's tip
+    }
+    return th;
+  }
+  const hp = honeyGeo.attributes.position, hn = honeyGeo.attributes.normal, NP = PROFILE.length;
+  function updateShell(t) {
+    for (let i = 0; i < hp.count; i++) {
+      const x = base[3 * i], y = base[3 * i + 1], z = base[3 * i + 2], th = honeyThickness(x, y, z, t);
+      hp.array[3 * i] = x + nrm[3 * i] * th; hp.array[3 * i + 1] = y + nrm[3 * i + 1] * th; hp.array[3 * i + 2] = z + nrm[3 * i + 2] * th;
+      tint.copy(clearTint).lerp(goldTint, smooth(seg(th, 0.018, 0.05)));
+      glazeCols.setXYZ(i, tint.r, tint.g, tint.b);
+    }
+    hp.needsUpdate = true;
+    glazeCols.needsUpdate = true;
+    honeyGeo.computeVertexNormals();
+    for (let j = 0; j < NP; j++) { // weld normals across the lathe seam
+      const a = j, b = SEGS * NP + j;
+      const nx = hn.getX(a) + hn.getX(b), ny = hn.getY(a) + hn.getY(b), nz = hn.getZ(a) + hn.getZ(b), l = Math.hypot(nx, ny, nz) || 1;
+      hn.setXYZ(a, nx / l, ny / l, nz / l); hn.setXYZ(b, nx / l, ny / l, nz / l);
+    }
+    honeyGeo.computeBoundingSphere();
+  }
+  for (const h of [front, back]) {
+    const m = glazeMat.clone(); m.clippingPlanes = [h.plane];
+    h.holder.add(new THREE.Mesh(honeyGeo, m));
+  }
+
+  // puddle around the base
+  const ps = new THREE.Shape();
+  for (let i = 0; i <= 120; i++) {
+    const a = i / 120 * Math.PI * 2, r = 1.2 + 0.1 * Math.sin(3 * a + 1) + 0.06 * Math.sin(7 * a + 2) + 0.03 * Math.sin(13 * a);
+    i ? ps.lineTo(Math.cos(a) * r, Math.sin(a) * r) : ps.moveTo(Math.cos(a) * r, Math.sin(a) * r);
+  }
+  const poolGeo = new THREE.ExtrudeGeometry(ps, { depth: 0.004, bevelEnabled: true, bevelThickness: 0.022, bevelSize: 0.08, bevelSegments: 6, curveSegments: 4 });
+  poolGeo.rotateX(-Math.PI / 2);
+  const pool = new THREE.Mesh(poolGeo, honeyMat);
+  pool.position.y = 0.022;
+  pool.receiveShadow = true;
+  scene.add(pool);
+
+  // honey smear on the blade, growing up from the edge as it cuts
+  const ss = new THREE.Shape();
+  ss.moveTo(-1.25, 0);
+  for (let i = 0; i <= 48; i++) { const x = -1.25 + 2.5 * i / 48; ss.lineTo(x, 0.1 + 0.06 * Math.sin(x * 5 + 1) + 0.035 * Math.sin(x * 11)); }
+  ss.lineTo(1.25, 0); ss.lineTo(-1.25, 0);
+  const smearGeo = new THREE.ExtrudeGeometry(ss, { depth: 0.03, bevelEnabled: true, bevelThickness: 0.006, bevelSize: 0.006, bevelSegments: 2 });
+  smearGeo.translate(0, 0, -0.015); smearGeo.rotateY(Math.PI / 2);
+  const smear = new THREE.Mesh(smearGeo, Object.assign(honeyMat.clone(), { thickness: 0.03 }));
+  knife.add(smear);
+
+  // strands between the halves (and one off the knife) that stretch, thin out and snap
+  const strandMat = new THREE.MeshPhysicalMaterial({
+    color: '#ffc040', transmission: 0.85, thickness: 0.03, attenuationColor: new THREE.Color('#c86000'), attenuationDistance: 0.08,
+    roughness: 0.02, ior: 1.49, clearcoat: 1, emissive: '#b85a00', emissiveIntensity: 0.15,
+  });
+  function makeTube(nAlong = 28, nAround = 8) {
+    const g = new THREE.BufferGeometry();
+    g.setAttribute('position', new THREE.BufferAttribute(new Float32Array((nAlong + 1) * (nAround + 1) * 3), 3));
+    const idx = [];
+    for (let i = 0; i < nAlong; i++) for (let j = 0; j < nAround; j++) {
+      const a = i * (nAround + 1) + j, b = (i + 1) * (nAround + 1) + j;
+      idx.push(a, b, a + 1, b, b + 1, a + 1);
+    }
+    g.setIndex(idx); g.userData = { nAlong, nAround };
+    return g;
+  }
+  const sagV = new THREE.Vector3();
+  function setTube(g, A, B, sag, radius) {
+    const { nAlong, nAround } = g.userData, p = g.attributes.position.array;
+    const curve = new THREE.QuadraticBezierCurve3(A, A.clone().lerp(B, 0.5).add(sagV.set(0, -sag, 0)), B);
+    const fr = curve.computeFrenetFrames(nAlong, false);
+    for (let i = 0; i <= nAlong; i++) {
+      const s = i / nAlong, c = curve.getPointAt(s), r = radius * (0.3 + 0.7 * (2 * s - 1) ** 2);
+      for (let j = 0; j <= nAround; j++) {
+        const an = j / nAround * Math.PI * 2, n = fr.normals[i], bn = fr.binormals[i], o = 3 * (i * (nAround + 1) + j);
+        p[o] = c.x + r * (Math.cos(an) * n.x + Math.sin(an) * bn.x);
+        p[o + 1] = c.y + r * (Math.cos(an) * n.y + Math.sin(an) * bn.y);
+        p[o + 2] = c.z + r * (Math.cos(an) * n.z + Math.sin(an) * bn.z);
+      }
+    }
+    g.attributes.position.needsUpdate = true;
+    g.computeVertexNormals(); g.computeBoundingSphere();
+  }
+  const strands = [];
+  for (const yy of [0.5, 0.15, -0.2, -0.5]) for (const side of [1, -1]) {
+    const y = yy + (rng() - 0.5) * 0.1;
+    strands.push({ kind: 'side', y, z: side * outerR(y) * 1.01 });
+  }
+  strands.push({ kind: 'top', y: AXIS_TOP + 0.06, z: 0 });
+  strands.push({ kind: 'knife' });
+  for (const s of strands) {
+    s.r0 = s.kind === 'knife' ? 0.03 : 0.025 + rng() * 0.02;
+    s.Lb = s.kind === 'knife' ? 1.2 : 0.5 + rng() * 0.7;
+    s.breakT = Infinity;
+    s.mesh = new THREE.Mesh(makeTube(), strandMat);
+    s.mesh.frustumCulled = false;
+    scene.add(s.mesh);
+  }
+  const A = new THREE.Vector3(), B = new THREE.Vector3();
+  // endpoints in world space for the current pose; returns false while the strand doesn't exist yet
+  function ends(s, t) {
+    if (s.kind === 'knife') {
+      if (t < T.lift) return false;
+      A.set(0, knifeState(t).y, 1.12); B.set(0, BOTTOM_Y + 0.03, 1.12);
+      cutGroup.localToWorld(A); cutGroup.localToWorld(B);
+      return true;
+    }
+    if (t < T.touch + 0.1 || (s.kind === 'side' && knifeState(Math.min(t, T.cutEnd)).y > s.y - 0.02)) return false;
+    back.holder.localToWorld(A.set(-0.002, s.y, s.z));
+    front.holder.localToWorld(B.set(0.002, s.y, s.z));
+    return true;
+  }
+  precomputeHoney = () => {
+    for (let t = 0; t <= DURATION; t += 1 / 240) {
+      poseAt(t);
+      for (const s of strands) if (s.breakT === Infinity && ends(s, t) && A.distanceTo(B) > s.Lb) {
+        s.breakT = t; honeyBreaks.push({ t, size: s.r0 });
+      }
+    }
+  };
+  updateHoney = t => {
+    updateShell(t);
+    const grow = lerp(0.92, 1.06, t / DURATION);
+    pool.scale.set(grow, 1, grow);
+    const cp = smooth(cutProgress(t));
+    smear.visible = cp > 0.01;
+    smear.scale.set(1, Math.max(cp, 0.01), 1);
+    for (const s of strands) {
+      const ok = t < s.breakT && ends(s, t), L = ok ? A.distanceTo(B) : 0;
+      s.mesh.visible = ok && L > 0.004;
+      if (s.mesh.visible) setTube(s.mesh.geometry, A, B, 0.15 * L * L + 0.02, s.r0 * clamp(Math.sqrt(0.15 / (L + 0.15)), 0.3, 1));
+    }
+  };
+}
+
+// ---------- camera ----------
+const focusPt = new THREE.Vector3();
+function placeCamera(t) {
+  const reveal = smooth(seg(t, 5.6, 8));
+  const d = lerp(CFG.cam.dist, CFG.cam.dist * 0.885, smooth(t / DURATION)) - 0.6 * reveal;
+  const el = deg(lerp(13, 30, reveal)), az = deg(lerp(-3, 4, t / DURATION));
+  focusPt.set(0, lerp(CFG.cam.target, CFG.cam.target * 0.9, reveal), 0);
+  camera.position.set(focusPt.x + d * Math.sin(az) * Math.cos(el), focusPt.y + d * Math.sin(el), focusPt.z + d * Math.cos(az) * Math.cos(el));
+  camera.lookAt(focusPt);
+  return d;
+}
+
+// ---------- post ----------
+const rt = new THREE.WebGLRenderTarget(W, H, { type: THREE.HalfFloatType, samples: 4 });
+const composer = new EffectComposer(renderer, rt);
+composer.addPass(new RenderPass(scene, camera));
+const bokeh = new BokehPass(scene, camera, { focus: 9, aperture: CFG.aperture || 0.0035, maxblur: 0.007 });
+composer.addPass(bokeh);
+composer.addPass(new UnrealBloomPass(new THREE.Vector2(W, H), 0.22, 0.35, 0.92));
+composer.addPass(new OutputPass());
+
+// ---------- frame ----------
+function poseAt(t) {
+  const k = knifeState(t);
+  knife.position.set(0, k.y, k.z);
+  knife.rotation.x = k.tilt;
+  const wedge = 0.045 * smooth(cutProgress(t));
+  const fall = frontFall(t);
+  const slide = easeOut(seg(t, T.fallStart, T.land + 0.3));
+  placeHalf(front, wedge + fall, 0.2 * slide, 0.55 * slide); // falls open toward the right, out of the reveal
+  const wobble = t > T.land ? 0.025 * Math.exp(-4 * (t - T.land)) * Math.sin(16 * (t - T.land)) : 0;
+  placeHalf(back, wedge * 0.5 + wobble, 0);
+}
+function renderAt(t) {
+  const d = placeCamera(t);
+  bokeh.uniforms.focus.value = d - 0.7;
+  poseAt(t);
+  const f = t < T.crack || CFG.shards === false ? 0 : Math.exp(-(t - T.crack) / 0.09);
+  flash.material.opacity = f;
+  flash.material.rotation = 0.3 + (t - T.crack) * 0.8;
+  flash.scale.setScalar(0.25 + 0.6 * f);
+  flash.visible = f > 0.01;
+  updateShards(t);
+  updateHoney(t);
+  composer.render();
+}
+window.renderAt = renderAt;
+window.getAudioData = () => {
+  resetSim(); stepSim(DURATION);
+  // per-millisecond knife speed, and how much flesh the edge is in (for crunch density)
+  const scrape = [], width = [];
+  for (let i = 0; i < DURATION * 1000; i++) {
+    const t = i / 1000;
+    if (t < (CFG.smoothCut ? T.touch : T.cutStart) || t > T.cutEnd) { scrape.push(0); width.push(0); continue; }
+    const a = knifeState(t), b = knifeState(t + 0.001);
+    scrape.push(Math.min(1, Math.abs(b.y - a.y) / 0.001 * 1.4 + Math.abs(b.z - a.z) / 0.001 * 0.6));
+    width.push(outerR(a.y) / MAX_R);
+  }
+  const out = { T, impacts: sim.impacts, scrape, width, audio: CFG.audio, honeyBreaks };
+  resetSim();
+  return out;
+};
+window.DURATION = DURATION;
+
+precomputeHoney();
+renderAt(0);
+window.sceneReady = true;
+if (!params.has('render')) {
+  const t0 = performance.now();
+  renderer.setAnimationLoop(() => renderAt(((performance.now() - t0) / 1000) % DURATION));
+}
+</script>
+</body>
+</html>
